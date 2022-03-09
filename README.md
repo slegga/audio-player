@@ -18,9 +18,9 @@ For windows, as the Administrator do:
 
 Then to run the app:
 
-    audio-player $ morbo audio-player
+    audio-player $ morbo audio-player2
 
-And browse to http://127.0.0.1:3000/refresh
+And first browse to http://127.0.0.1:3000/refresh to index your audio.  Thereafter, http://127.0.0.1:3000/
 
 ~
 
@@ -32,3 +32,4 @@ Hidden interface features:  Clicking the word "Rating" will take you to the /sta
 
 This app has built-in playback error detection.  So for example, if **advance** is on and an error is detected, the app will attempt to load to the next track. And the same goes for **shuffle** mode.  Now if none of the selected tracks (e.g. search results) can be loaded, the app will try each and fail.  If **shuffle** is on and this happens, an infinite loop will occur.  In order to stop this, just click the "Clear Search" button - the bold **x** button on the right of the search box or press the `x` key.
 
+![audio-player2](audio-player2.png)
