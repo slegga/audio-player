@@ -88,11 +88,11 @@ get '/' => sub ($c) {
       push @$match, $key if lc($audio->{$key}{track}) =~ /$query/i;
     }
 
-#    my %tracks;
-#    for my $n (@$match) {
-#      $tracks{ $audio->{$n}{track} } = $n;
-#    }
-#    $match = [ map { $tracks{$_} } sort { $a cmp $b } keys %tracks ];
+    my %tracks;
+    for my $n (@$match) {
+      $tracks{ $audio->{$n}{track} } = $n;
+    }
+    $match = [ map { $tracks{$_} } sort { $a cmp $b } keys %tracks ];
 
     $current = _get_current($match, $current, $shuffle, $noinc);
   }
@@ -153,8 +153,8 @@ sub _get_current ($match, $current, $shuffle, $noinc) {
   }
   else {
     # Find the index of the current item in the search results
-    my $idx = first_index { $_ >= $current } @$match;
-    $idx = 0 unless $idx;
+    my $idx = first_index { $_ == $current } @$match;
+    $idx = 0 if $idx == -1;
 
     # To increment, or not to increment...
     if ($noinc) {
@@ -353,7 +353,7 @@ __DATA__
 % # Audio widget
 <p>
   <div>
-    <audio controls id="myAudio" <%= $autoplay ? "autoplay='autoplay'" : '' %> preload="auto" crossorigin="anonymous" src="<%== $track %>" title="Audio controls - Pause/play (y)">
+    <audio controls id="myAudio" <%= $autoplay ? "autoplay='autoplay'" : '' %> preload="auto" crossorigin="anonymous" src="<%== $track %>" title="Audio controls (c) - Pause/play (y)">
       Your browser does not support the <code>audio</code> element.
     </audio>
     <div id="warning"><b>Could not load audio!</b></div>
@@ -419,11 +419,6 @@ __DATA__
 <p></p>
 <p><b>Matches:</b> <%= $matches %></p>
 <ol>
-%   my %tracks;
-%   for my $n (@$match) {
-%     $tracks{ $audio->{$n}{track} } = $n;
-%   }
-%   $match = [ map { $tracks{$_} } sort { $a cmp $b } keys %tracks ];
 %   for my $n (@$match) {
   <li>
 %     if ($track eq $audio->{$n}{track}) {
@@ -533,7 +528,7 @@ $(document).ready( function () {
     j++;
   }
 
-% # Miscelaneous jQuery on events
+% # Miscellaneous jQuery on events
   $('#playlist').on('change', function () {
     var current = $(this).children('option:selected').val();
     advance(1, current, 1, 0);
@@ -549,7 +544,11 @@ $(document).ready( function () {
     var x = $('#query').is(':focus');
     if (!x) {
       var rate = -1; // For rating below
-      if (e.which == 121) {
+      if (e.which == 99) {
+        // Audio controls = c
+        $('#myAudio').focus();
+      }
+      else if (e.which == 121) {
         // Pause-Play = y
         var audio = document.getElementById('myAudio');
         if (audio.paused) {
