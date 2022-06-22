@@ -2,17 +2,22 @@
 
 =head1 NAME
 
-audio-player3
+audio-player4
 
 =head1 DESCRIPTION
 
-This program is the evolution of audioplayer2, and is a lightweight,
-simple audio server.
+This program is the evolution of audioplayer3, and is a lightweight,
+simple audio server.  It has been heavily customized for my use.  For
+a generic player, see the previous incarnation, C<audio-player3>.
 
 This app has logic to fetch cover art from the L<last.fm> API.  In
 order to do this, the artist, track and album names are divined (with
 regular expressions).  Change this in the source below for your
 filenames.
+
+New to this version is that it can do waveform analysis with C<R>
+and the C<tuneR> package.  Also new is optional system volume
+management (on my linux machine).
 
 Write-up: https://ology.github.io/2021/06/04/mojolicious-music-player/
 
@@ -23,7 +28,7 @@ the C<public> directory.
 
 On unix-like systems, symlink your audio source:
 
-  audio-player/public $ ln -s /media/you/external_drive/Music/ Audio
+  audio-player/public> ln -s /media/you/external_drive/Music/ Audio
 
 Or on windows, as the Administrator:
 
@@ -31,7 +36,7 @@ Or on windows, as the Administrator:
 
 Then:
 
-  audio-player $ morbo audio-player3
+  audio-player> morbo audio-player4
 
 And browse to:
 
@@ -39,28 +44,48 @@ And browse to:
 
 =cut
 
+
 use Data::Dumper::Compact qw(ddc);
 use Encoding::FixLatin qw(fix_latin);
 use File::Find::Rule ();
 use List::SomeUtils qw(first_index);
+use Math::Utils qw(uniform_scaling);
 use Mojolicious::Lite -signatures;
 use Mojo::Util qw(url_unescape);
 use Number::Format ();
+use Statistics::R ();
 use Storable qw(retrieve store);
-use Try::Tiny;
+use Try::Tiny qw(try catch);
 use lib map { "$ENV{HOME}/sandbox/$_/lib" } qw(WebService-LastFM-TrackInfo);
-use WebService::LastFM::TrackInfo;
+use WebService::LastFM::TrackInfo ();
 use YAML::XS qw(LoadFile);
 
 use constant RATES  => (0 .. 5); #qw(None Bad Poor Fair Good Best);
-use constant EXTS   => qr/\.(flac|m4a|mp3|ogg|wav)$/i;  # Tracks of interest
-use constant PATH   => 'public/Audio/';        # Where the audio files live
-use constant TRACKS => app->moniker . '.dat';  # The tracks file
+use constant TYPES  => qr/\.(?:flac|m4a|mp3|ogg|wav)$/i;  # Tracks of interest
+use constant PATH   => 'public/Audio/';                   # Where the audio lives
+use constant TRACKS => app->moniker . '.dat';             # The tracks file
+use constant CONFIG => 'config.yml';                      # The configuration file
 
-# ./config.yml file:
-# api_key: 'abcdef123456'
-my $config = LoadFile 'config.yml';
-my $API_KEY = $config->{api_key}; # for last.fm
+# track name info
+use constant TRACK_INFO => 1;
+use constant DUMPOPTS   => { max_width => 128 }; # for ddc()
+
+# frequency analysis
+use constant ANALYZE => 1;
+use constant WIDTH   => 1600;
+use constant HEIGHT  => 300;
+use constant FREQ    => 'frequency.png'; # relative to public/
+
+# volume management
+use constant MANAGE_VOL => 1;
+use constant MAX_AMPL   => 32768; # for 16 bit audio
+use constant DB_RANGE   => [-14,  0];
+use constant VOL_RANGE  => [ 83, 64];
+
+# load the configuration file and get the API key
+my $config  = -e CONFIG ? LoadFile(CONFIG) : {};
+my $API_KEY = $config->{api_key};
+
 
 =head1 ROUTES
 
@@ -78,7 +103,7 @@ get '/' => sub ($c) {
   my $current     = $c->param('current') || 0;     # The last and next played track
   my $noinc       = $c->param('noinc') || 0;       # Do not increment to the next track
   my $shuffle     = $c->param('shuffle') || 0;     # Select a random track to play next
-  my $query       = $c->param('query') || '';      # The (url_escaped) search query
+  my $query       = $c->param('query') || '';      # The url encoded search query
   my $showrate    = $c->param('showrate') || '';   # Filter by the requested rate
   my $darkmode    = $c->param('darkmode') || 0;    # Use dark mode
 
@@ -87,17 +112,21 @@ get '/' => sub ($c) {
   my $audio = {}; # Bucket for all tracks
   my $match = []; # Bucket for all query matches
 
+  my $track_info;  # discovered track details
+  my $track_image; # cover art
+  my $freq_image;  # frequency analysis
+
   # Load the track list or flash an error
   if (-e TRACKS) {
     $audio = retrieve(TRACKS);
   }
   else {
-    $c->flash(message => 'Cannot read track list file. Please <a href="/refresh">refresh</a>');
+    $c->flash(error => 'Cannot read track list file. Please <a href="/refresh">refresh</a>');
   }
 
   if (keys %$audio) {
     if ($query) {
-      # Convert encoded things like &amp; back into &
+      # Convert encoded things like %26 back into &
       $query = url_unescape($query);
 
       # Brute force through every track, looking for matches
@@ -140,30 +169,80 @@ get '/' => sub ($c) {
   # Handle the undef case that makes bad things happen
   $current = -1 unless defined $current;
 
-  # Do not have a track when there is no current track index
+  # get the track and rating
   my $track  = '';
   my $rating = 0;
-
-  # Ok get the track and rating
-  if (keys %$audio) {
-    $track  = $current >= 0 ? $audio->{$current}{track} : '';
-    $rating = $current >= 0 ? $audio->{$current}{rating} : 0;
+  if (keys %$audio && $current >= 0) {
+    $track  = $audio->{$current}{track};
+    $rating = $audio->{$current}{rating};
   }
-#  app->log->debug("Current: $current, Track: $track");
+  app->log->info("Track: $current $track");
 
-  # Add a number separator comma
+  # Add a number separator (comma)
   my $nf = Number::Format->new;
   my $total = $nf->format_number(scalar keys %$audio);
   my $matches = $nf->format_number(scalar @$match);
 
+  # analyze the mp3 track if requested
+  if (ANALYZE && $track && ($track =~ /\.mp3$/i || $track =~ /\.wav$/i)) {
+    my $freq_file = 'public/' . FREQ;
+    my $tune = "public$track";
+    my ($w, $h) = (WIDTH, HEIGHT);
+    my $R = Statistics::R->new;
+    $R->run(q`library(tuneR)`);
+    $R->run(qq`tune <- readMP3("$tune")`)  if $track =~ /\.mp3$/i;
+    $R->run(qq`tune <- readWave("$tune")`) if $track =~ /\.wav$/i;
+    $R->run(q`seconds <- length(tune) / tune@samp.rate`);
+    #$R->run(q`tune <- mono(tune, which=c("both"))`);
+    #$R->run(q`tune <- normalize(tune, unit=c("1"))`);
+    $R->run(qq`png("$freq_file", width=$w, height=$h)`);
+    $R->run(q`par(bg="#DADADA")`);
+    $R->run(qq`plot(tune, xaxt="n", main="$track", xlab="seconds")`);
+    $R->run(q`axis(1, at=seq(0, seconds, 10), labels=FALSE)`);
+    $R->run(q`axis(1, at=seq(0, seconds, 30))`); # label every 30 seconds
+    $R->run(q`dev.off()`);
+    my $summary = $R->get('summary(tune)'); # R returns a space separated arrayref!
+    my $peak = $R->get('max(tune@left, tune@right, abs(min(tune@left, tune@right)))');
+    $R->stop;
+
+    $freq_image = '/' . FREQ if -e $freq_file;
+
+    if (MANAGE_VOL && defined $peak) {
+      my $loudness = 20 * _log10($peak / MAX_AMPL);
+      my ($volume) = uniform_scaling(DB_RANGE, VOL_RANGE, $loudness);
+      $volume = int $volume;
+      app->log->info("Loudness=$loudness ∴ Set volume to $volume%");
+      my @cmd = (qw(amixer -q set Master), $volume . '%');
+      system(@cmd) == 0
+        or die "system(@cmd) failed: $?";
+    }
+
+    # perform these regex gymnastics in order to make the info nicer
+    $summary = join ' ', $summary->@*;
+    my @parts = $summary =~ m|
+      ^
+      ( [\w\s()/]+: \s [\d.-]+   ) \s
+      ( [\w\s()/]+: \s [\d.-]+   ) \s
+      ( [\w\s()/]+: \s [\d.-]+   ) \s
+      ( [\w\s()/]+: \s \w+       ) \s
+      ( [\w\s()/]+: \s \w+       ) \s
+      ( [\w\s()/]+: \s [\d.-]+   ) \s
+      ( [\w\s()/]+: \s .+? Max\. ) \s
+      ( [\w.-]+ \s .+ )
+      $
+    |gx;
+    $track_info->{frequency} = \@parts if @parts;
+
+    push $track_info->{frequency}->@*, "Max: $peak";
+  }
+
   # Parse the track name and find an image
-  my $track_info;
-  my $track_image;
-  if ($track) {
-    my @parts = split /\//, $track;
-    my $name = $parts[-1]; # track name
-    my $album = $parts[-2]; # album name
+  if ($API_KEY && $track) {
+    my @parts  = split /\//, $track;
+    my $name   = $parts[-1]; # track name
+    my $album  = $parts[-2]; # album name
     my $artist = $parts[-3]; # but not always
+    my $types  = TYPES;
 
     # Handle cases like:
     # 01 Tom Sawyer-1647382734.mp3
@@ -171,65 +250,65 @@ get '/' => sub ($c) {
     # 05 Let Me Tell You About My Boat.m4a
     # New Day-6SumbNBSEo8.m4a
     # Revolution 1 (Remastered 2009)-OmsXsIv2Ppw.m4a
+    # Goodbye Stranger (2010 Remastered)-u8pVZ5hTGJQ.m4a
     # A Reminiscent Drive - Ambrosia-rP89haLVP4k.m4a
     # Van Halen - Hot For Teacher (Official Music Video)-6M4_Ommfvv0.m4a
-
-    $name =~ s/^(?:\d+-)?\d+\s+(.*?)/$1/;
-    $name =~ s/(.*?)-\d+\.mp3$/$1/;
-    $name =~ s/(.*?)\.mp3$/$1/;
-    $name =~ s/(.*?)-[\w-]+\.m4a$/$1/;
-    $name =~ s/(.*?)\.m4a$/$1/;
-    $name =~ s/(.*?) \((?:Official )?Audio\)/$1/;
-    $name =~ s/(.*?) \(Remastered(?: \d+)?\)/$1/;
-    $name =~ s/(.*?) \(\d+ Remaster\)/$1/;
-    $name =~ s/(.*?) \(Official\s*(?:Lyric|Music)?\s*Video\)/$1/;
-    $name =~ s/$artist\s*-\s*(.*?)$/$1/;
+    $name =~ s/^(?:\d+-)?\d+\s+(.*?)/$1/;                         # disc-track number
+    $name =~ s/(.*?)-\d+\.mp3$/$1/;                               # reencoded mp3
+    $name =~ s/(.*?)-[\w-]+\.(?:m4a|mp3)$/$1/;                    # from youtube
+    $name =~ s/(.*?)$types/$1/i;                                  # audio file
+    $name =~ s/(.*?) \((?:Official )?Audio\)/$1/;                 # paren extras
+    $name =~ s/(.*?) \(Remastered(?: \d+)?\)/$1/;                 # "
+    $name =~ s/(.*?) \(\d+ Remaster(?:ed)?\)/$1/;                 # "
+    $name =~ s/(.*?) \(Official\s*(?:Lyric|Music)?\s*Video\)/$1/; # "
+    $name =~ s/$artist\s*-\s*(.*?)$/$1/;                          # artist in track
 
     # Special case
     if ($track =~ /Hôtel Costes/) {
-      $name =~ s/Hotel Costes \d+ - (.*)$/$1/;
-      my ($who, $what) = split /\s*-\s*/, $name, 2;
+      $name =~ s/Hotel Costes \d+ - (.*)$/$1/;      # album in track
+      my ($who, $what) = split /\s*-\s*/, $name, 2; # artist in track
       ($artist, $name) = ($who, $what)
         if $who && $what;
     }
 
     # Find an image
+    my $info;
     my $w = WebService::LastFM::TrackInfo->new(api_key => $API_KEY);
     try {
-      $track_info = $w->fetch(
-          artist => $artist,
-          track  => $name,
-      );
+      $info = $w->fetch(artist => $artist, track => $name);
     };
-    $track_image = _get_image($track_info->{track}{album});
+    $track_image = _get_image($info->{track}{album});
     unless ($track_image) {
       $w = WebService::LastFM::TrackInfo->new(
         api_key => $API_KEY,
         method  => 'album',
       );
       try {
-        $track_info = $w->fetch(
-          artist => $artist,
-          album  => $album,
-        );
+        $info = $w->fetch(artist => $artist, album => $album);
       };
-      $track_image = _get_image($track_info->{album});
+      $track_image = _get_image($info->{album});
     }
 
     $track_info->{computed_title} = "|$artist| |$album| |$name|";
+
+    $track_info = { %$info, %$track_info };
+
+    app->log->info("Found cover art for $track_info->{computed_title}")
+      if $track_image;
   }
 
   $c->render(
     template    => 'index',
     audio       => $audio,
     total       => $total,
+    current     => $current,
     track       => $track,
-    track_info  => ddc($track_info, {max_width => 128}),
+    track_info  => TRACK_INFO ? ddc($track_info, DUMPOPTS) : '',
     track_image => $track_image,
+    freq_image  => $freq_image,
     rating      => $rating,
     autoplay    => $autoplay,
     autoadvance => $autoadvance,
-    current     => $current,
     shuffle     => $shuffle,
     query       => $query,
     match       => $match,
@@ -240,12 +319,14 @@ get '/' => sub ($c) {
   );
 } => 'index';
 
+sub _log10 { return log(shift)/log(10) }
+
 sub _get_image ($data) {
-  return undef unless $data->{image} && @{ $data->{image} };
+  return undef unless $data->{image} && $data->{image}->@*;
 
   my $image;
 
-  for my $item (@{ $data->{image} }) {
+  for my $item ($data->{image}->@*) {
     if ($item->{size} eq 'extralarge' && $item->{'#text'}) {
       $image = $item->{'#text'};
       last;
@@ -300,6 +381,8 @@ sub _in_rate_range ($op, $rate, $track_rating) {
 Track file initialize and refresh endpoint that redirects back to the
 C<index>.
 
+* This resets all track ratings to zero!
+
 Name: C<refresh>
 
 =cut
@@ -311,29 +394,21 @@ get '/refresh' => sub ($c) {
     $old = retrieve(TRACKS);
   }
 
-  # Assume there are no duplicate tracks
-  my %by_name;
-  for my $i (keys %$old) {
-    $by_name{ $old->{$i}{track} } = $old->{$i}{rating};
-  }
-
   # Process the filenames
   my $audio = {};
-  my @files = File::Find::Rule->file()->name(EXTS)->in(PATH);
+  my $rule = File::Find::Rule->new;
+  my @files = $rule->file()
+    ->not($rule->new->name(qr/^\./)) # no dot files please
+    ->name(TYPES)->in(PATH);
   my $n = 0;
   for my $file (@files) {
-    # Remove "public" from the name
+    # Make the name relative to /
     $file =~ s/^public//;
     # Make sure the name is properly displayable
     $file = fix_latin($file);
 
-    # Determine the track rating
-    my $rate = 0;
-    $rate = $by_name{$file}
-      if exists $by_name{$file};
-
     # Add an entry to the audio list
-    $audio->{$n} = { track => $file, rating => $rate };
+    $audio->{$n} = { track => $file, rating => 0 };
 
     $n++;
   }
@@ -377,7 +452,7 @@ post '/rating' => sub ($c) {
 
 =head2 GET /stats
 
-Track stats endpoint that renders a page with rating counts.
+Render a page with rating counts.
 
 Name: C<stats>
 
@@ -394,8 +469,8 @@ get '/stats' => sub ($c) {
     $rate->{$r}++;
     $total++;
 
-    (my $genre = $audio->{$key}{track}) =~ s|^/Audio/(.+?)/.+$|$1|;
-    $by_genre->{$genre}++ if $audio->{$key}{rating};
+    my @parts = split /\//, $audio->{$key}{track};
+    $by_genre->{ $parts[2] }++ if $audio->{$key}{rating};
   }
 
   $c->render(
@@ -407,7 +482,10 @@ get '/stats' => sub ($c) {
   );
 } => 'stats';
 
+
+app->secrets($config->{secrets});
 app->start;
+
 
 =head1 AUTHOR
 
@@ -549,6 +627,13 @@ __DATA__
 %   }
 % }
 
+% if ($freq_image) {
+<div>
+  <img src="<%= $freq_image %>"/>
+  <p></p>
+</div>
+% }
+
 % # Track info
 % if ($track_info) {
 <p></p>
@@ -683,6 +768,18 @@ $(document).ready( function () {
         else {
           audio.pause();
         }
+      }
+      else if (e.which == 122) {
+        // space-music = z
+        var link = "<%= url_for('index') %>?current=0"
+          + '&noinc=0'
+          + '&query=space-music'
+          + "&shuffle=<%= $shuffle %>"
+          + "&autoplay=<%= $autoplay %>"
+          + "&autoadvance=<%= $autoadvance %>"
+          + "&showrate=<%= $showrate %>"
+          + "&darkmode=<%= $darkmode %>"
+        window.location = link;
       }
       else if (e.which == 102) {
         // First track = f
@@ -888,7 +985,7 @@ $('input[name=rating]').attr('disabled', true);
     <p></p>
     <div id="footer" class="text-secondary">
       <hr>
-      <a href="https://github.com/ology/audio-player">audio-player3</a>
+      <a href="https://github.com/ology/audio-player">audio-player4</a>
       built by <a href="http://gene.ology.net/">Gene</a>
       with <a href="https://www.perl.org/">Perl</a>,
       <a href="https://mojolicious.org/">Mojolicious</a>
