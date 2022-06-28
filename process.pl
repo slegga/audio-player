@@ -25,7 +25,7 @@ TRACK: for my $n (sort { $a <=> $b } keys %$audio) {
   my $track = Mojo::File->new("public$audio->{$n}{track}");
   next unless -e $track;
   $i++;
-  print "Processing $track...\n";
+#  print "Processing $track...\n";
   my $rating = $audio->{$n}{rating};
   if ($rating < 0) {
 #    print '-' x 70, "\n";
@@ -57,19 +57,19 @@ TRACK: for my $n (sort { $a <=> $b } keys %$audio) {
 #  elsif ($rating && $rating >= 3) {
 #    print "$i. KEEP: $n $track\n";
 #  }
-  elsif ($track =~ /\.m4a$/) {
-    my $outfile = convert($track);
-    unless ($outfile && -e $outfile) {
-      warn "\tERROR: Can't convert track\n";
-      next TRACK;
-    }
-    my $match = EXTERN;
-    $outfile =~ s/^$match//;
-    $audio->{$n}{track} = $outfile;
-    print "\tSet converted track to $outfile\n";
-    $track->remove or warn "ERROR: Can't remove $track: $!\n";
-    print "\tRemoved original track\n";
-  }
+#  elsif ($track =~ /\.m4a$/) {
+#    my $outfile = convert($track);
+#    unless ($outfile && -e $outfile) {
+#      warn "\tERROR: Can't convert track\n";
+#      next TRACK;
+#    }
+#    my $match = EXTERN;
+#    $outfile =~ s/^$match//;
+#    $audio->{$n}{track} = $outfile;
+#    print "\tSet converted track to $outfile\n";
+#    $track->remove or warn "ERROR: Can't remove $track: $!\n";
+#    print "\tRemoved original track\n";
+#  }
 }
 
 # Save the tracks to disk
